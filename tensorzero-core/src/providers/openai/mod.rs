@@ -648,6 +648,209 @@ impl OpenAIProvider {
             })
         }))
     }
+
+    /// Performs a single streaming inference attempt with an optional explicit API key.
+    #[expect(clippy::too_many_arguments)]
+    async fn infer_stream_single_attempt<'a>(
+        &'a self,
+        request: &'a ModelInferenceRequest<'a>,
+        http_client: &'a TensorzeroHttpClient,
+        model_provider: &'a ModelProvider,
+        model_name: &'a str,
+        provider_name: &'a str,
+        override_api_key: Option<&SecretString>,
+        dynamic_api_keys: &'a InferenceCredentials,
+    ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
+        let api_key: Option<SecretString> = if let Some(key) = override_api_key {
+            Some(key.clone())
+        } else {
+            self.credentials
+                .get_api_key_owned(dynamic_api_keys)
+                .map_err(|e| e.log())?
+        };
+        let start_time = Instant::now();
+
+        match self.api_type {
+            OpenAIAPIType::Responses => {
+                let request_url =
+                    get_responses_url(self.api_base.as_ref().unwrap_or(&OPENAI_DEFAULT_BASE_URL))?;
+
+                let request_body = serde_json::to_value(
+                    OpenAIResponsesRequest::new(
+                        &self.model_name,
+                        request,
+                        false,
+                        &self.provider_tools,
+                        model_name,
+                        provider_name,
+                    )
+                    .await?,
+                )
+                .map_err(|e| {
+                    Error::new(ErrorDetails::Serialization {
+                        message: format!(
+                            "Error serializing OpenAI Responses request: {}",
+                            DisplayOrDebugGateway::new(e)
+                        ),
+                    })
+                })?;
+
+                let mut request_builder = http_client.post(request_url);
+                if let Some(ref api_key) = api_key {
+                    request_builder = request_builder.bearer_auth(api_key.expose_secret());
+                }
+
+                let (event_source, raw_request) = inject_extra_request_data_and_send_eventsource(
+                    PROVIDER_TYPE,
+                    &request.extra_body,
+                    &request.extra_headers,
+                    model_provider,
+                    model_name,
+                    request_body,
+                    request_builder,
+                )
+                .await?;
+
+                let stream = stream_openai_responses(
+                    PROVIDER_TYPE.to_string(),
+                    event_source.map_err(TensorZeroEventError::EventSource),
+                    start_time,
+                    model_provider.discard_unknown_chunks,
+                    model_name,
+                    provider_name,
+                    &raw_request,
+                )
+                .peekable();
+                Ok((stream, raw_request))
+            }
+            OpenAIAPIType::ChatCompletions => {
+                let request_url =
+                    get_chat_url(self.api_base.as_ref().unwrap_or(&OPENAI_DEFAULT_BASE_URL))?;
+
+                let request_body =
+                    serde_json::to_value(OpenAIRequest::new(&self.model_name, request).await?)
+                        .map_err(|e| {
+                            Error::new(ErrorDetails::Serialization {
+                                message: format!(
+                                    "Error serializing OpenAI request: {}",
+                                    DisplayOrDebugGateway::new(e)
+                                ),
+                            })
+                        })?;
+
+                let mut request_builder = http_client.post(request_url);
+                if let Some(ref api_key) = api_key {
+                    request_builder = request_builder.bearer_auth(api_key.expose_secret());
+                }
+
+                let (event_source, raw_request) = inject_extra_request_data_and_send_eventsource(
+                    PROVIDER_TYPE,
+                    &request.extra_body,
+                    &request.extra_headers,
+                    model_provider,
+                    model_name,
+                    request_body,
+                    request_builder,
+                )
+                .await?;
+
+                let stream = stream_openai(
+                    PROVIDER_TYPE.to_string(),
+                    event_source.map_err(TensorZeroEventError::EventSource),
+                    start_time,
+                    &raw_request,
+                )
+                .peekable();
+                Ok((stream, raw_request))
+            }
+        }
+    }
+
+    /// Performs streaming inference with retry logic for KeyPool credentials.
+    ///
+    /// Retry only happens during connection establishment, not after streaming begins.
+    #[expect(clippy::too_many_arguments)]
+    async fn infer_stream_with_retry<'a>(
+        &'a self,
+        request: &'a ModelInferenceRequest<'a>,
+        http_client: &'a TensorzeroHttpClient,
+        model_provider: &'a ModelProvider,
+        model_name: &'a str,
+        provider_name: &'a str,
+        pool: &Arc<KeyPool>,
+        dynamic_api_keys: &'a InferenceCredentials,
+    ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
+        let retry_config = RetryConfig::default();
+        let max_attempts = pool.max_retries() + 1;
+        let mut last_error: Option<Error> = None;
+
+        for attempt in 0..max_attempts {
+            let api_key = pool.next_key();
+
+            let result = self
+                .infer_stream_single_attempt(
+                    request,
+                    http_client,
+                    model_provider,
+                    model_name,
+                    provider_name,
+                    Some(api_key),
+                    dynamic_api_keys,
+                )
+                .await;
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    let status_code = match e.get_details() {
+                        ErrorDetails::InferenceClient { status_code, .. } => {
+                            status_code.map(|s| s.as_u16())
+                        }
+                        _ => None,
+                    };
+
+                    let is_retryable = status_code.map(is_retryable_status_code).unwrap_or(false);
+                    let has_more_attempts = attempt + 1 < max_attempts;
+
+                    if let (true, true, Some(code)) = (is_retryable, has_more_attempts, status_code)
+                    {
+                        if should_rotate_key_for_status(code) {
+                            tracing::warn!(
+                                "Retrying streaming inference with next key (attempt {}/{}, status: {})",
+                                attempt + 1,
+                                max_attempts,
+                                code
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Retrying streaming inference (attempt {}/{}, status: {})",
+                                attempt + 1,
+                                max_attempts,
+                                code
+                            );
+                        }
+
+                        let delay = retry_config.delay_for_attempt(attempt);
+                        tokio::time::sleep(delay).await;
+
+                        last_error = Some(e);
+                        continue;
+                    }
+
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            Error::new(ErrorDetails::InferenceServer {
+                message: "All streaming retry attempts exhausted".to_string(),
+                raw_request: None,
+                raw_response: None,
+                provider_type: PROVIDER_TYPE.to_string(),
+            })
+        }))
+    }
 }
 
 impl InferenceProvider for OpenAIProvider {
@@ -682,108 +885,32 @@ impl InferenceProvider for OpenAIProvider {
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let api_key = self
-            .credentials
-            .get_api_key(dynamic_api_keys)
-            .map_err(|e| e.log())?;
-        let start_time = Instant::now();
-
-        match self.api_type {
-            OpenAIAPIType::Responses => {
-                let request_url =
-                    get_responses_url(self.api_base.as_ref().unwrap_or(&OPENAI_DEFAULT_BASE_URL))?;
-
-                // TODO - support encrypted reasoning in streaming
-                let request_body = serde_json::to_value(
-                    OpenAIResponsesRequest::new(
-                        &self.model_name,
-                        request,
-                        false,
-                        &self.provider_tools,
-                        model_name,
-                        provider_name,
-                    )
-                    .await?,
-                )
-                .map_err(|e| {
-                    Error::new(ErrorDetails::Serialization {
-                        message: format!(
-                            "Error serializing OpenAI Responses request: {}",
-                            DisplayOrDebugGateway::new(e)
-                        ),
-                    })
-                })?;
-
-                let mut request_builder = http_client.post(request_url);
-                if let Some(api_key) = api_key {
-                    request_builder = request_builder.bearer_auth(api_key.expose_secret());
-                }
-
-                let (event_source, raw_request) = inject_extra_request_data_and_send_eventsource(
-                    PROVIDER_TYPE,
-                    &request.extra_body,
-                    &request.extra_headers,
+        // For Pool credentials, use retry logic with key rotation
+        if let Some(pool) = self.credentials.as_pool() {
+            return self
+                .infer_stream_with_retry(
+                    request,
+                    http_client,
                     model_provider,
-                    model_name,
-                    request_body,
-                    request_builder,
-                )
-                .await?;
-
-                let stream = stream_openai_responses(
-                    PROVIDER_TYPE.to_string(),
-                    event_source.map_err(TensorZeroEventError::EventSource),
-                    start_time,
-                    model_provider.discard_unknown_chunks,
                     model_name,
                     provider_name,
-                    &raw_request,
+                    pool,
+                    dynamic_api_keys,
                 )
-                .peekable();
-                Ok((stream, raw_request))
-            }
-            OpenAIAPIType::ChatCompletions => {
-                // Use Chat Completions API for streaming
-                let request_url =
-                    get_chat_url(self.api_base.as_ref().unwrap_or(&OPENAI_DEFAULT_BASE_URL))?;
-
-                let request_body =
-                    serde_json::to_value(OpenAIRequest::new(&self.model_name, request).await?)
-                        .map_err(|e| {
-                            Error::new(ErrorDetails::Serialization {
-                                message: format!(
-                                    "Error serializing OpenAI request: {}",
-                                    DisplayOrDebugGateway::new(e)
-                                ),
-                            })
-                        })?;
-
-                let mut request_builder = http_client.post(request_url);
-                if let Some(api_key) = api_key {
-                    request_builder = request_builder.bearer_auth(api_key.expose_secret());
-                }
-
-                let (event_source, raw_request) = inject_extra_request_data_and_send_eventsource(
-                    PROVIDER_TYPE,
-                    &request.extra_body,
-                    &request.extra_headers,
-                    model_provider,
-                    model_name,
-                    request_body,
-                    request_builder,
-                )
-                .await?;
-
-                let stream = stream_openai(
-                    PROVIDER_TYPE.to_string(),
-                    event_source.map_err(TensorZeroEventError::EventSource),
-                    start_time,
-                    &raw_request,
-                )
-                .peekable();
-                Ok((stream, raw_request))
-            }
+                .await;
         }
+
+        // For non-pool credentials, use the single-attempt logic
+        self.infer_stream_single_attempt(
+            request,
+            http_client,
+            model_provider,
+            model_name,
+            provider_name,
+            None,
+            dynamic_api_keys,
+        )
+        .await
     }
 
     /// 1. Upload the requests to OpenAI as a File

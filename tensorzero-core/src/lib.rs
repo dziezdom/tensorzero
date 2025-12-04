@@ -7,6 +7,7 @@ pub mod client; // Rust client for TensorZero
 pub mod config; // TensorZero config file
 pub mod credentials; // credential management abstractions
 pub mod db;
+pub mod discovery; // model auto-discovery from providers
 pub mod embeddings; // embedding inference
 pub mod endpoints; // API endpoints
 pub mod error; // error handling
