@@ -644,6 +644,7 @@ fn load_credential(
             }
         },
         CredentialLocation::Dynamic(key_name) => Ok(Credential::Dynamic(key_name.clone())),
+        CredentialLocation::Pool(pool_name) => Ok(Credential::Pool(pool_name.clone())),
         CredentialLocation::Sdk => Ok(Credential::Sdk),
         CredentialLocation::None => Ok(Credential::None),
     }

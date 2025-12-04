@@ -1,0 +1,122 @@
+# TensorZero with Infisical Secret Management
+# This example demonstrates multi-key credential management with automatic rotation
+#
+# Features:
+# - ClickHouse for observability data
+# - PostgreSQL for structured data
+# - Infisical for secret management
+# - Multiple API keys with automatic rotation on rate limits
+#
+# Usage:
+#   1. Set up Infisical and add your API keys
+#   2. Create .env file with required variables (see .env.example)
+#   3. docker compose up -d
+#   4. Access gateway at http://localhost:3000
+#   5. Access UI at http://localhost:4000
+
+services:
+  # =========================================================================
+  # Databases
+  # =========================================================================
+
+  clickhouse:
+    image: clickhouse:lts
+    environment:
+      CLICKHOUSE_USER: chuser
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_PASSWORD: chpassword
+    ports:
+      - "8123:8123" # HTTP interface
+      - "9000:9000" # Native interface
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: wget --spider --tries 1 http://chuser:chpassword@clickhouse:8123/ping
+      start_period: 30s
+      start_interval: 1s
+      timeout: 1s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tensorzero
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tensorzero"]
+      start_period: 30s
+      start_interval: 1s
+      timeout: 1s
+    restart: unless-stopped
+
+  # =========================================================================
+  # TensorZero Gateway
+  # =========================================================================
+
+  gateway:
+    image: tensorzero/gateway
+    volumes:
+      - ./config:/app/config:ro
+    command: --config-file /app/config/tensorzero.toml
+    environment:
+      # Database connections
+      TENSORZERO_CLICKHOUSE_URL: http://chuser:chpassword@clickhouse:8123/tensorzero
+      TENSORZERO_POSTGRES_URL: postgres://postgres:postgres@postgres:5432/tensorzero
+
+      # Infisical credentials (for multi-key management)
+      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID}
+      INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET}
+      INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID}
+
+      # Direct API keys (fallback or single-key mode)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_AI_STUDIO_API_KEY: ${GOOGLE_AI_STUDIO_API_KEY:-}
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: wget --spider --tries 1 http://localhost:3000/status
+      interval: 15s
+      timeout: 1s
+      retries: 2
+    restart: unless-stopped
+
+  # =========================================================================
+  # TensorZero UI (optional)
+  # =========================================================================
+
+  ui:
+    image: tensorzero/ui
+    volumes:
+      - ./config:/app/config:ro
+    environment:
+      TENSORZERO_CLICKHOUSE_URL: http://chuser:chpassword@clickhouse:8123/tensorzero
+      TENSORZERO_GATEWAY_URL: http://gateway:3000
+      # UI needs an API key for running evaluations
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "4000:4000"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:
+  postgres-data:

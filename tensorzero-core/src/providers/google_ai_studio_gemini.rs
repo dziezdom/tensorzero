@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{future::try_join_all, StreamExt};
@@ -14,6 +15,7 @@ use uuid::Uuid;
 use super::helpers::check_new_tool_call_name;
 use super::helpers::inject_extra_request_data_and_send_eventsource;
 use crate::cache::ModelProviderRequest;
+use crate::credentials::KeyPool;
 use crate::endpoints::inference::InferenceCredentials;
 use crate::error::warn_discarded_thought_block;
 use crate::error::warn_discarded_unknown_chunk;
@@ -59,10 +61,17 @@ pub struct GoogleAIStudioGeminiProvider {
     streaming_request_url: Url,
     #[serde(skip)]
     credentials: GoogleAIStudioCredentials,
+    #[serde(skip)]
+    #[ts(skip)]
+    credential_pools: Option<Arc<crate::credentials::CredentialPools>>,
 }
 
 impl GoogleAIStudioGeminiProvider {
-    pub fn new(model_name: String, credentials: GoogleAIStudioCredentials) -> Result<Self, Error> {
+    pub fn new(
+        model_name: String,
+        credentials: GoogleAIStudioCredentials,
+        credential_pools: Option<Arc<crate::credentials::CredentialPools>>,
+    ) -> Result<Self, Error> {
         let request_url = Url::parse(&format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
         ))
@@ -84,6 +93,7 @@ impl GoogleAIStudioGeminiProvider {
             request_url,
             streaming_request_url,
             credentials,
+            credential_pools,
         })
     }
 
@@ -97,6 +107,9 @@ pub enum GoogleAIStudioCredentials {
     Static(SecretString),
     Dynamic(String),
     None,
+    Pool(Arc<KeyPool>),
+    /// Reference to a named credential pool (resolved at inference time)
+    PoolRef(String),
     WithFallback {
         default: Box<GoogleAIStudioCredentials>,
         fallback: Box<GoogleAIStudioCredentials>,
@@ -111,6 +124,7 @@ impl TryFrom<Credential> for GoogleAIStudioCredentials {
             Credential::Static(key) => Ok(GoogleAIStudioCredentials::Static(key)),
             Credential::Dynamic(key_name) => Ok(GoogleAIStudioCredentials::Dynamic(key_name)),
             Credential::Missing => Ok(GoogleAIStudioCredentials::None),
+            Credential::Pool(pool_name) => Ok(GoogleAIStudioCredentials::PoolRef(pool_name)),
             Credential::WithFallback { default, fallback } => {
                 Ok(GoogleAIStudioCredentials::WithFallback {
                     default: Box::new((*default).try_into()?),
@@ -126,6 +140,9 @@ impl TryFrom<Credential> for GoogleAIStudioCredentials {
 }
 
 impl GoogleAIStudioCredentials {
+    /// Gets an API key as a reference. Not supported for Pool credentials.
+    ///
+    /// For Pool credentials, use `get_api_key_owned` instead.
     pub fn get_api_key<'a>(
         &'a self,
         dynamic_api_keys: &'a InferenceCredentials,
@@ -159,23 +176,142 @@ impl GoogleAIStudioCredentials {
                     message: "No credentials are set".to_string(),
                 }))
             }
+            GoogleAIStudioCredentials::Pool(_) | GoogleAIStudioCredentials::PoolRef(_) => {
+                Err(DelayedError::new(ErrorDetails::Config {
+                    message: "Pool credentials require using get_api_key_owned()".to_string(),
+                }))
+            }
+        }
+    }
+
+    /// Gets an API key as an owned value. Works for all credential types including Pool.
+    ///
+    /// For Pool credentials, this returns the next key in round-robin order.
+    /// For PoolRef credentials, this requires the credential_pools to be passed.
+    pub fn get_api_key_owned(
+        &self,
+        dynamic_api_keys: &InferenceCredentials,
+    ) -> Result<SecretString, DelayedError> {
+        match self {
+            GoogleAIStudioCredentials::Static(api_key) => Ok(api_key.clone()),
+            GoogleAIStudioCredentials::Dynamic(key_name) => {
+                dynamic_api_keys.get(key_name).cloned().ok_or_else(|| {
+                    DelayedError::new(ErrorDetails::ApiKeyMissing {
+                        provider_name: PROVIDER_NAME.to_string(),
+                        message: format!("Dynamic api key `{key_name}` is missing"),
+                    })
+                })
+            }
+            GoogleAIStudioCredentials::WithFallback { default, fallback } => {
+                match default.get_api_key_owned(dynamic_api_keys) {
+                    Ok(key) => Ok(key),
+                    Err(e) => {
+                        e.log_at_level(
+                            "Using fallback credential, as default credential is unavailable: ",
+                            tracing::Level::WARN,
+                        );
+                        fallback.get_api_key_owned(dynamic_api_keys)
+                    }
+                }
+            }
+            GoogleAIStudioCredentials::None => {
+                Err(DelayedError::new(ErrorDetails::ApiKeyMissing {
+                    provider_name: PROVIDER_NAME.to_string(),
+                    message: "No credentials are set".to_string(),
+                }))
+            }
+            GoogleAIStudioCredentials::Pool(pool) => Ok(pool.next_key().clone()),
+            GoogleAIStudioCredentials::PoolRef(pool_name) => {
+                // PoolRef requires credential_pools - use get_api_key_from_pool instead
+                Err(DelayedError::new(ErrorDetails::Config {
+                    message: format!(
+                        "PoolRef credentials '{pool_name}' require using get_api_key_from_pool()"
+                    ),
+                }))
+            }
+        }
+    }
+
+    /// Gets an API key from a named credential pool.
+    ///
+    /// This method is async because it may need to fetch keys from external sources.
+    pub async fn get_api_key_from_pool(
+        &self,
+        dynamic_api_keys: &InferenceCredentials,
+        credential_pools: &crate::credentials::CredentialPools,
+    ) -> Result<SecretString, DelayedError> {
+        match self {
+            GoogleAIStudioCredentials::PoolRef(pool_name) => {
+                let pool = credential_pools.get(pool_name).ok_or_else(|| {
+                    DelayedError::new(ErrorDetails::ApiKeyMissing {
+                        provider_name: PROVIDER_NAME.to_string(),
+                        message: format!("Credential pool '{pool_name}' not found"),
+                    })
+                })?;
+
+                pool.get_key()
+                    .await
+                    .map_err(|e| {
+                        DelayedError::new(ErrorDetails::ApiKeyMissing {
+                            provider_name: PROVIDER_NAME.to_string(),
+                            message: format!("Failed to get key from pool '{pool_name}': {e}"),
+                        })
+                    })?
+                    .ok_or_else(|| {
+                        DelayedError::new(ErrorDetails::ApiKeyMissing {
+                            provider_name: PROVIDER_NAME.to_string(),
+                            message: format!("No keys available in pool '{pool_name}'"),
+                        })
+                    })
+            }
+            // For non-pool credentials, delegate to get_api_key_owned
+            _ => self.get_api_key_owned(dynamic_api_keys),
+        }
+    }
+
+    /// Returns true if these credentials use a key pool.
+    pub fn is_pool(&self) -> bool {
+        matches!(
+            self,
+            GoogleAIStudioCredentials::Pool(_) | GoogleAIStudioCredentials::PoolRef(_)
+        )
+    }
+
+    /// Returns the key pool if this is a Pool credential, None otherwise.
+    pub fn as_pool(&self) -> Option<&Arc<KeyPool>> {
+        match self {
+            GoogleAIStudioCredentials::Pool(pool) => Some(pool),
+            _ => None,
+        }
+    }
+
+    /// Returns the pool name if this is a PoolRef credential, None otherwise.
+    pub fn as_pool_ref(&self) -> Option<&str> {
+        match self {
+            GoogleAIStudioCredentials::PoolRef(name) => Some(name),
+            _ => None,
         }
     }
 }
 
-impl InferenceProvider for GoogleAIStudioGeminiProvider {
-    /// Google AI Studio Gemini non-streaming API request
-    async fn infer<'a>(
+// ============================================================================
+// Retry helpers for KeyPool-based credentials
+// ============================================================================
+
+use crate::credentials::{is_retryable_status_code, should_rotate_key_for_status, RetryConfig};
+
+impl GoogleAIStudioGeminiProvider {
+    /// Performs a single inference attempt with an optional explicit API key.
+    #[expect(clippy::too_many_arguments)]
+    async fn infer_single_attempt<'a>(
         &'a self,
-        ModelProviderRequest {
-            request,
-            provider_name,
-            model_name,
-            otlp_config: _,
-        }: ModelProviderRequest<'a>,
+        request: &'a ModelInferenceRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
+        model_name: &'a str,
+        provider_name: &'a str,
+        override_api_key: Option<&SecretString>,
     ) -> Result<ProviderInferenceResponse, Error> {
         let request_body =
             serde_json::to_value(GeminiRequest::new(request).await?).map_err(|e| {
@@ -186,10 +322,15 @@ impl InferenceProvider for GoogleAIStudioGeminiProvider {
                     ),
                 })
             })?;
-        let api_key = self
-            .credentials
-            .get_api_key(dynamic_api_keys)
-            .map_err(|e| e.log())?;
+
+        let api_key: SecretString = if let Some(key) = override_api_key {
+            key.clone()
+        } else {
+            self.credentials
+                .get_api_key_owned(dynamic_api_keys)
+                .map_err(|e| e.log())?
+        };
+
         let start_time = Instant::now();
         let mut url = self.request_url.clone();
         url.query_pairs_mut()
@@ -208,6 +349,7 @@ impl InferenceProvider for GoogleAIStudioGeminiProvider {
         let latency = Latency::NonStreaming {
             response_time: start_time.elapsed(),
         };
+
         if res.status().is_success() {
             let raw_response = res.text().await.map_err(|e| {
                 Error::new(ErrorDetails::InferenceServer {
@@ -257,6 +399,266 @@ impl InferenceProvider for GoogleAIStudioGeminiProvider {
             })?;
             handle_google_ai_studio_error(response_code, error_body)
         }
+    }
+
+    /// Performs inference with retry logic for Pool credentials.
+    #[expect(clippy::too_many_arguments)]
+    async fn infer_with_retry<'a>(
+        &'a self,
+        request: &'a ModelInferenceRequest<'a>,
+        http_client: &'a TensorzeroHttpClient,
+        dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
+        model_name: &'a str,
+        provider_name: &'a str,
+        pool: &'a Arc<KeyPool>,
+    ) -> Result<ProviderInferenceResponse, Error> {
+        let retry_config = RetryConfig::default();
+        let max_attempts = pool.max_retries() + 1; // +1 for the initial attempt
+        let mut last_error: Option<Error> = None;
+
+        for attempt in 0..max_attempts {
+            let api_key = pool.next_key();
+
+            match self
+                .infer_single_attempt(
+                    request,
+                    http_client,
+                    dynamic_api_keys,
+                    model_provider,
+                    model_name,
+                    provider_name,
+                    Some(api_key),
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    // Extract status code from error details
+                    let status_code = match e.get_details() {
+                        ErrorDetails::InferenceClient { status_code, .. } => {
+                            status_code.map(|s| s.as_u16())
+                        }
+                        _ => None,
+                    };
+
+                    let is_retryable = status_code.map(is_retryable_status_code).unwrap_or(false);
+                    let has_more_attempts = attempt + 1 < max_attempts;
+
+                    if let (true, true, Some(code)) = (is_retryable, has_more_attempts, status_code)
+                    {
+                        if should_rotate_key_for_status(code) {
+                            tracing::warn!(
+                                "Retrying inference with next key (attempt {}/{}, status: {})",
+                                attempt + 2,
+                                max_attempts,
+                                code
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Retrying inference (attempt {}/{}, status: {})",
+                                attempt + 2,
+                                max_attempts,
+                                code
+                            );
+                        }
+
+                        // Wait before retry with exponential backoff
+                        let delay = retry_config.delay_for_attempt(attempt);
+                        tokio::time::sleep(delay).await;
+
+                        last_error = Some(e);
+                        continue;
+                    }
+
+                    // Non-retryable error or no more attempts, return immediately
+                    return Err(e);
+                }
+            }
+        }
+
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| {
+            Error::new(ErrorDetails::InferenceServer {
+                message: "All retry attempts exhausted".to_string(),
+                provider_type: PROVIDER_TYPE.to_string(),
+                raw_request: None,
+                raw_response: None,
+            })
+        }))
+    }
+
+    /// Performs inference with retry logic for dynamic KeyProvider credentials.
+    #[expect(clippy::too_many_arguments)]
+    async fn infer_with_retry_key_provider<'a>(
+        &'a self,
+        request: &'a ModelInferenceRequest<'a>,
+        http_client: &'a TensorzeroHttpClient,
+        dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
+        model_name: &'a str,
+        provider_name: &'a str,
+        key_provider: &'a dyn crate::credentials::KeyProvider,
+    ) -> Result<ProviderInferenceResponse, Error> {
+        let retry_config = RetryConfig::default();
+        let max_attempts = 4; // Default max retries for KeyProvider
+        let mut last_error: Option<Error> = None;
+
+        for attempt in 0..max_attempts {
+            // Fetch key from the provider
+            let api_key = key_provider
+                .get_key()
+                .await
+                .map_err(|e| {
+                    Error::new(ErrorDetails::ApiKeyMissing {
+                        provider_name: PROVIDER_NAME.to_string(),
+                        message: format!("Failed to get key from provider: {e}"),
+                    })
+                })?
+                .ok_or_else(|| {
+                    Error::new(ErrorDetails::ApiKeyMissing {
+                        provider_name: PROVIDER_NAME.to_string(),
+                        message: "No keys available from provider".to_string(),
+                    })
+                })?;
+
+            match self
+                .infer_single_attempt(
+                    request,
+                    http_client,
+                    dynamic_api_keys,
+                    model_provider,
+                    model_name,
+                    provider_name,
+                    Some(&api_key),
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    // Extract status code from error details
+                    let status_code = match e.get_details() {
+                        ErrorDetails::InferenceClient { status_code, .. } => {
+                            status_code.map(|s| s.as_u16())
+                        }
+                        _ => None,
+                    };
+
+                    let is_retryable = status_code.map(is_retryable_status_code).unwrap_or(false);
+                    let has_more_attempts = attempt + 1 < max_attempts;
+
+                    if let (true, true, Some(code)) = (is_retryable, has_more_attempts, status_code)
+                    {
+                        if should_rotate_key_for_status(code) {
+                            tracing::warn!(
+                                "Retrying inference with next key (attempt {}/{}, status: {})",
+                                attempt + 2,
+                                max_attempts,
+                                code
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Retrying inference (attempt {}/{}, status: {})",
+                                attempt + 2,
+                                max_attempts,
+                                code
+                            );
+                        }
+
+                        // Wait before retry with exponential backoff
+                        let delay = retry_config.delay_for_attempt(attempt);
+                        tokio::time::sleep(delay).await;
+
+                        last_error = Some(e);
+                        continue;
+                    }
+
+                    // Non-retryable error or no more attempts, return immediately
+                    return Err(e);
+                }
+            }
+        }
+
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| {
+            Error::new(ErrorDetails::InferenceServer {
+                message: "All retry attempts exhausted".to_string(),
+                provider_type: PROVIDER_TYPE.to_string(),
+                raw_request: None,
+                raw_response: None,
+            })
+        }))
+    }
+}
+
+impl InferenceProvider for GoogleAIStudioGeminiProvider {
+    /// Google AI Studio Gemini non-streaming API request
+    async fn infer<'a>(
+        &'a self,
+        ModelProviderRequest {
+            request,
+            provider_name,
+            model_name,
+            otlp_config: _,
+        }: ModelProviderRequest<'a>,
+        http_client: &'a TensorzeroHttpClient,
+        dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
+    ) -> Result<ProviderInferenceResponse, Error> {
+        // If using Pool credentials (Arc<KeyPool>), use retry logic
+        if let Some(pool) = self.credentials.as_pool() {
+            return self
+                .infer_with_retry(
+                    request,
+                    http_client,
+                    dynamic_api_keys,
+                    model_provider,
+                    model_name,
+                    provider_name,
+                    pool,
+                )
+                .await;
+        }
+
+        // If using PoolRef credentials (reference to credential pool by name), resolve and use retry logic
+        if let Some(pool_name) = self.credentials.as_pool_ref() {
+            let credential_pools = self.credential_pools.as_ref().ok_or_else(|| {
+                Error::new(ErrorDetails::Config {
+                    message: format!(
+                        "PoolRef credential '{pool_name}' requires credential_pools to be set"
+                    ),
+                })
+            })?;
+            let key_provider = credential_pools.get(pool_name).ok_or_else(|| {
+                Error::new(ErrorDetails::ApiKeyMissing {
+                    provider_name: PROVIDER_NAME.to_string(),
+                    message: format!("Credential pool '{pool_name}' not found"),
+                })
+            })?;
+            return self
+                .infer_with_retry_key_provider(
+                    request,
+                    http_client,
+                    dynamic_api_keys,
+                    model_provider,
+                    model_name,
+                    provider_name,
+                    key_provider.as_ref(),
+                )
+                .await;
+        }
+
+        // Standard path for non-pool credentials
+        self.infer_single_attempt(
+            request,
+            http_client,
+            dynamic_api_keys,
+            model_provider,
+            model_name,
+            provider_name,
+            None,
+        )
+        .await
     }
 
     /// Google AI Studio Gemini streaming API request

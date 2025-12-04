@@ -34,6 +34,7 @@ use crate::config::gateway::{GatewayConfig, UninitializedGatewayConfig};
 use crate::config::path::{ResolvedTomlPathData, ResolvedTomlPathDirectory};
 use crate::config::snapshot::ConfigSnapshot;
 use crate::config::span_map::SpanMap;
+use crate::credentials::CredentialPoolConfig;
 use crate::db::clickhouse::{ClickHouseConnectionInfo, ExternalDataInfo};
 use crate::embeddings::{EmbeddingModelTable, UninitializedEmbeddingModelConfig};
 use crate::endpoints::inference::DEFAULT_FUNCTION_NAME;
@@ -105,7 +106,7 @@ pub struct Config {
     #[serde(skip)]
     pub templates: Arc<TemplateConfig<'static>>,
     pub object_store_info: Option<ObjectStoreInfo>,
-    pub provider_types: ProviderTypesConfig,
+    pub provider_types: Arc<ProviderTypesConfig>,
     pub optimizers: HashMap<String, OptimizerInfo>,
     pub postgres: PostgresConfig,
     pub rate_limiting: RateLimitingConfig,
@@ -113,6 +114,8 @@ pub struct Config {
     pub http_client: TensorzeroHttpClient,
     #[serde(skip)]
     pub hash: SnapshotHash,
+    #[serde(skip)]
+    pub credential_pools: Arc<crate::credentials::CredentialPools>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ts_rs::TS)]
@@ -857,6 +860,13 @@ impl Config {
 
         let http_client = TensorzeroHttpClient::new(gateway_config.global_outbound_http_timeout)?;
 
+        // Initialize credential pools from [credentials.*] config section
+        let credential_pools = crate::credentials::initialize_credential_pools(
+            uninitialized_config.credentials,
+            http_client.clone(),
+        )
+        .await?;
+
         // Load user-defined functions and ensure they don't use tensorzero:: prefix
         let user_functions = uninitialized_config
             .functions
@@ -881,37 +891,48 @@ impl Config {
             .into_iter()
             .map(|(name, config)| config.load(name.clone()).map(|c| (name, Arc::new(c))))
             .collect::<Result<HashMap<String, Arc<StaticToolConfig>>, Error>>()?;
-        let provider_type_default_credentials = Arc::new(ProviderTypeDefaultCredentials::new(
-            &uninitialized_config.provider_types,
-        ));
+        let provider_types = Arc::new(uninitialized_config.provider_types);
+        let provider_type_default_credentials =
+            Arc::new(ProviderTypeDefaultCredentials::new(&provider_types));
 
-        let models = try_join_all(uninitialized_config.models.into_iter().map(
-            |(name, config)| async {
-                config
-                    .load(
-                        &name,
-                        &uninitialized_config.provider_types,
-                        &provider_type_default_credentials,
-                        http_client.clone(),
-                    )
-                    .await
-                    .map(|c| (name, c))
-            },
-        ))
+        let models = try_join_all(
+            uninitialized_config
+                .models
+                .into_iter()
+                .map(|(name, config)| {
+                    let credential_pools = credential_pools.clone();
+                    let provider_types = provider_types.clone();
+                    let default_credentials = provider_type_default_credentials.clone();
+                    let client = http_client.clone();
+                    async move {
+                        config
+                            .load(
+                                &name,
+                                &provider_types,
+                                &default_credentials,
+                                client,
+                                Some(credential_pools),
+                            )
+                            .await
+                            .map(|c| (name, c))
+                    }
+                }),
+        )
         .await?
         .into_iter()
         .collect::<HashMap<_, _>>();
 
         let embedding_models = try_join_all(uninitialized_config.embedding_models.into_iter().map(
-            |(name, config)| async {
-                config
-                    .load(
-                        &uninitialized_config.provider_types,
-                        &provider_type_default_credentials,
-                        http_client.clone(),
-                    )
-                    .await
-                    .map(|c| (name, c))
+            |(name, config)| {
+                let provider_types = provider_types.clone();
+                let default_credentials = provider_type_default_credentials.clone();
+                let client = http_client.clone();
+                async move {
+                    config
+                        .load(&provider_types, &default_credentials, client)
+                        .await
+                        .map(|c| (name, c))
+                }
             },
         ))
         .await?
@@ -987,12 +1008,13 @@ impl Config {
             evaluations: HashMap::new(),
             templates: Arc::new(templates),
             object_store_info,
-            provider_types: uninitialized_config.provider_types,
+            provider_types,
             optimizers,
             postgres: uninitialized_config.postgres,
             rate_limiting: uninitialized_config.rate_limiting.try_into()?,
             http_client,
             hash: snapshot.hash.clone(),
+            credential_pools,
         };
 
         // Validate the config
@@ -1410,6 +1432,8 @@ pub struct UninitializedConfig {
     #[serde(default)]
     pub rate_limiting: UninitializedRateLimitingConfig,
     pub object_storage: Option<StorageKind>,
+    #[serde(default)]
+    pub credentials: HashMap<String, CredentialPoolConfig>, // credential pool name => pool config
     #[serde(default)]
     pub models: HashMap<Arc<str>, UninitializedModelConfig>, // model name => model config
     #[serde(default)]

@@ -774,6 +774,259 @@ impl RetryConfig {
     }
 }
 
+// ============================================================================
+// Credential Pool Configuration - for [credentials.*] section in tensorzero.toml
+// ============================================================================
+
+/// Configuration for a named credential pool in `tensorzero.toml`.
+///
+/// This is used in the `[credentials]` section to define reusable credential pools
+/// that can be referenced by model providers.
+///
+/// # Example
+///
+/// ```toml
+/// [credentials.openai_pool]
+/// type = "infisical"
+/// site_url = "https://secrets.example.com"
+/// client_id = { env = "INFISICAL_CLIENT_ID" }
+/// client_secret = { env = "INFISICAL_CLIENT_SECRET" }
+/// project_id = { env = "INFISICAL_PROJECT_ID" }
+/// environment = "production"
+/// secret_path = "/openai"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CredentialPoolConfig {
+    /// Infisical secret manager integration.
+    Infisical(Box<InfisicalPoolConfig>),
+
+    /// Multiple keys from environment variables.
+    EnvList(EnvListPoolConfig),
+}
+
+/// Configuration for an Infisical credential pool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InfisicalPoolConfig {
+    /// Infisical site URL (e.g., "https://app.infisical.com").
+    /// Can be a direct value or an environment variable reference.
+    pub site_url: StringOrEnv,
+
+    /// Machine Identity Client ID.
+    pub client_id: StringOrEnv,
+
+    /// Machine Identity Client Secret.
+    pub client_secret: StringOrEnv,
+
+    /// Infisical Project ID.
+    pub project_id: StringOrEnv,
+
+    /// Environment name (e.g., "dev", "staging", "production").
+    #[serde(default = "default_environment")]
+    pub environment: StringOrEnv,
+
+    /// Path to secrets in Infisical (e.g., "/openai", "/google").
+    pub secret_path: String,
+
+    /// How often to refresh secrets from Infisical (in seconds).
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval_secs: u64,
+}
+
+/// Configuration for environment variable list credential pool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EnvListPoolConfig {
+    /// List of environment variable names containing API keys.
+    pub vars: Vec<String>,
+}
+
+/// A string value that can either be a direct value or resolved from an environment variable.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum StringOrEnv {
+    /// Direct string value.
+    Direct(String),
+    /// Value from an environment variable.
+    Env {
+        env: String,
+        #[serde(default)]
+        default: Option<String>,
+    },
+}
+
+impl StringOrEnv {
+    /// Resolves the value, either directly or from the environment.
+    pub fn resolve(&self) -> Result<String, Error> {
+        match self {
+            StringOrEnv::Direct(s) => Ok(s.clone()),
+            StringOrEnv::Env { env, default } => std::env::var(env).or_else(|_| {
+                default.clone().ok_or_else(|| {
+                    Error::new(ErrorDetails::Config {
+                        message: format!("Environment variable '{env}' is not set"),
+                    })
+                })
+            }),
+        }
+    }
+}
+
+fn default_environment() -> StringOrEnv {
+    StringOrEnv::Direct("production".to_string())
+}
+
+fn default_refresh_interval() -> u64 {
+    300 // 5 minutes
+}
+
+// ============================================================================
+// Initialized Credential Pools - runtime types for credential management
+// ============================================================================
+
+/// Collection of initialized credential pools, keyed by pool name.
+#[derive(Debug, Default)]
+pub struct CredentialPools {
+    pools: std::collections::HashMap<String, Arc<dyn KeyProvider>>,
+}
+
+impl CredentialPools {
+    /// Creates a new empty credential pools collection.
+    pub fn new() -> Self {
+        Self {
+            pools: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Adds a pool to the collection.
+    pub fn insert(&mut self, name: String, pool: Arc<dyn KeyProvider>) {
+        self.pools.insert(name, pool);
+    }
+
+    /// Gets a pool by name.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn KeyProvider>> {
+        self.pools.get(name).cloned()
+    }
+
+    /// Returns an iterator over all pools.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<dyn KeyProvider>)> {
+        self.pools.iter()
+    }
+
+    /// Returns the number of pools.
+    pub fn len(&self) -> usize {
+        self.pools.len()
+    }
+
+    /// Returns true if there are no pools.
+    pub fn is_empty(&self) -> bool {
+        self.pools.is_empty()
+    }
+}
+
+impl CredentialPoolConfig {
+    /// Initializes a credential pool from configuration.
+    ///
+    /// This creates the appropriate `KeyProvider` implementation based on the pool type.
+    pub async fn initialize(
+        self,
+        pool_name: &str,
+        http_client: crate::http::TensorzeroHttpClient,
+    ) -> Result<Arc<dyn KeyProvider>, Error> {
+        match self {
+            CredentialPoolConfig::Infisical(config) => {
+                let site_url = url::Url::parse(&config.site_url.resolve()?).map_err(|e| {
+                    Error::new(ErrorDetails::Config {
+                        message: format!("Invalid Infisical site URL for pool '{pool_name}': {e}"),
+                    })
+                })?;
+
+                let infisical_config = crate::infisical::InfisicalConfig::new(
+                    site_url,
+                    config.client_id.resolve()?,
+                    SecretString::new(config.client_secret.resolve()?.into()),
+                    config.project_id.resolve()?,
+                    config.environment.resolve()?,
+                    config.secret_path.clone(),
+                )
+                .with_refresh_interval(std::time::Duration::from_secs(
+                    config.refresh_interval_secs,
+                ));
+
+                let provider = crate::infisical::InfisicalKeyProvider::new(
+                    infisical_config,
+                    http_client,
+                    pool_name.to_string(),
+                );
+
+                // Initialize the cache
+                provider.refresh().await.map_err(|e| {
+                    Error::new(ErrorDetails::Config {
+                        message: format!(
+                            "Failed to initialize Infisical key provider for pool '{pool_name}': {e}"
+                        ),
+                    })
+                })?;
+
+                // Spawn background refresh worker
+                let provider = Arc::new(provider);
+                let worker_provider = Arc::clone(&provider);
+                let refresh_interval = std::time::Duration::from_secs(config.refresh_interval_secs);
+                // The refresh worker is a background task that periodically refreshes credentials.
+                // It's okay for the gateway to shut down without waiting for this task since:
+                // 1. The task only performs read operations (fetching secrets)
+                // 2. No data loss can occur from interrupting it
+                // 3. Credentials will be re-fetched on next gateway startup
+                #[expect(clippy::disallowed_methods)]
+                tokio::spawn(async move {
+                    crate::infisical::refresh_worker_loop(worker_provider, refresh_interval).await;
+                });
+
+                Ok(provider)
+            }
+            CredentialPoolConfig::EnvList(config) => {
+                let mut keys = Vec::new();
+                for var in &config.vars {
+                    match std::env::var(var) {
+                        Ok(value) => keys.push(SecretString::new(value.into())),
+                        Err(_) => {
+                            return Err(Error::new(ErrorDetails::Config {
+                                message: format!(
+                                    "Environment variable '{var}' not found for pool '{pool_name}'"
+                                ),
+                            }))
+                        }
+                    }
+                }
+
+                if keys.is_empty() {
+                    return Err(Error::new(ErrorDetails::Config {
+                        message: format!("No keys found for pool '{pool_name}'"),
+                    }));
+                }
+
+                let provider = RoundRobinKeyProvider::with_name(keys, pool_name)?;
+                Ok(Arc::new(provider))
+            }
+        }
+    }
+}
+
+/// Initializes all credential pools from configuration.
+pub async fn initialize_credential_pools(
+    configs: std::collections::HashMap<String, CredentialPoolConfig>,
+    http_client: crate::http::TensorzeroHttpClient,
+) -> Result<Arc<CredentialPools>, Error> {
+    let mut pools = CredentialPools::new();
+
+    for (name, config) in configs {
+        tracing::info!("Initializing credential pool: {}", name);
+        let pool = config.initialize(&name, http_client.clone()).await?;
+        pools.insert(name.clone(), pool);
+        tracing::info!("Credential pool '{}' initialized successfully", name);
+    }
+
+    Ok(Arc::new(pools))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -100,12 +100,14 @@ impl UninitializedModelConfig {
         provider_types: &ProviderTypesConfig,
         provider_type_default_credentials: &ProviderTypeDefaultCredentials,
         http_client: TensorzeroHttpClient,
+        credential_pools: Option<Arc<crate::credentials::CredentialPools>>,
     ) -> Result<ModelConfig, Error> {
         // We want `ModelProvider` to know its own name (from the 'providers' config section).
         // We first deserialize to `HashMap<Arc<str>, UninitializedModelProvider>`, and then
         // build `ModelProvider`s using the name keys from the map.
         let providers = try_join_all(self.providers.into_iter().map(|(name, provider)| {
             let http_client = http_client.clone();
+            let credential_pools = credential_pools.clone();
             async move {
                 Ok::<_, Error>((
                     name.clone(),
@@ -117,6 +119,7 @@ impl UninitializedModelConfig {
                                 provider_types,
                                 provider_type_default_credentials,
                                 http_client,
+                                credential_pools,
                             )
                             .await
                             .map_err(|e| {
@@ -1152,6 +1155,7 @@ impl UninitializedProviderConfig {
         provider_types: &ProviderTypesConfig,
         provider_type_default_credentials: &ProviderTypeDefaultCredentials,
         http_client: TensorzeroHttpClient,
+        credential_pools: Option<Arc<crate::credentials::CredentialPools>>,
     ) -> Result<ProviderConfig, Error> {
         Ok(match self {
             UninitializedProviderConfig::Anthropic {
@@ -1304,6 +1308,7 @@ impl UninitializedProviderConfig {
                         provider_type_default_credentials,
                     )
                     .await?,
+                credential_pools.clone(),
             )?),
             UninitializedProviderConfig::Groq {
                 model_name,
@@ -2064,6 +2069,8 @@ pub enum CredentialLocation {
     Path(String),
     /// Use a provider-specific SDK to determine credentials
     Sdk,
+    /// Reference to a named credential pool
+    Pool(String),
     None,
 }
 
@@ -2156,6 +2163,8 @@ impl<'de> Deserialize<'de> for CredentialLocation {
             Ok(CredentialLocation::Dynamic(inner.to_string()))
         } else if let Some(inner) = s.strip_prefix("path::") {
             Ok(CredentialLocation::Path(inner.to_string()))
+        } else if let Some(inner) = s.strip_prefix("pool::") {
+            Ok(CredentialLocation::Pool(inner.to_string()))
         } else if s == "sdk" {
             Ok(CredentialLocation::Sdk)
         } else if s == "none" {
@@ -2178,6 +2187,7 @@ impl Serialize for CredentialLocation {
             CredentialLocation::PathFromEnv(inner) => format!("path_from_env::{inner}"),
             CredentialLocation::Dynamic(inner) => format!("dynamic::{inner}"),
             CredentialLocation::Path(inner) => format!("path::{inner}"),
+            CredentialLocation::Pool(inner) => format!("pool::{inner}"),
             CredentialLocation::Sdk => "sdk".to_string(),
             CredentialLocation::None => "none".to_string(),
         };
@@ -2268,6 +2278,8 @@ pub enum Credential {
         default: Box<Credential>,
         fallback: Box<Credential>,
     },
+    /// Reference to a credential pool (will be resolved at inference time)
+    Pool(String),
 }
 
 pub const SHORTHAND_MODEL_PREFIXES: &[&str] = &[
@@ -2327,6 +2339,7 @@ impl ShorthandModelConfig for ModelConfig {
                     GoogleAIStudioGeminiKind
                         .get_defaulted_credential(None, default_credentials)
                         .await?,
+                    None, // No credential pools for shorthand models
                 )?)
             }
             "gcp_vertex_gemini" => ProviderConfig::GCPVertexGemini(

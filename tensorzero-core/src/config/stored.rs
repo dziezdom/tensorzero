@@ -76,6 +76,7 @@ impl From<UninitializedConfig> for StoredConfig {
             provider_types,
             optimizers,
             embedding_models,
+            credentials: _, // credentials are not stored, only used at initialization
         } = stored;
 
         // Note: as we migrate the config and deprecate stuff in the future,
@@ -130,6 +131,7 @@ impl From<StoredConfig> for UninitializedConfig {
             evaluations,
             provider_types,
             optimizers,
+            credentials: HashMap::new(), // credentials are not stored
         }
     }
 }

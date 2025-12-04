@@ -671,7 +671,7 @@ impl UninitializedEmbeddingProviderConfig {
     ) -> Result<EmbeddingProviderInfo, Error> {
         let provider_config = self
             .config
-            .load(provider_types, default_credentials, http_client)
+            .load(provider_types, default_credentials, http_client, None)
             .await?;
         // Handle timeout deprecation
         let timeout_ms = match (self.timeout_ms, self.timeouts.non_streaming.total_ms) {

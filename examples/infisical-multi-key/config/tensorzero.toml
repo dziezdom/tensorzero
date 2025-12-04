@@ -1,0 +1,57 @@
+# TensorZero Configuration with Infisical Multi-Key Support
+#
+# This example demonstrates:
+# - Multiple API keys from Infisical with automatic rotation
+# - Rate limit handling with key rotation
+#
+# Infisical structure (secrets.kleron.dev):
+#   /google/API_KEY_1 = AIza...
+#   /google/API_KEY_2 = AIza...
+#   /google/API_KEY_3 = AIza...
+#   /google/API_KEY_4 = AIza... (tag: tier-1)
+
+# =============================================================================
+# Credential Pools
+# =============================================================================
+
+# Google Gemini keys from Infisical
+[credentials.google_pool]
+type = "infisical"
+site_url = { env = "INFISICAL_SITE_URL", default = "https://app.infisical.com" }
+client_id = { env = "INFISICAL_CLIENT_ID" }
+client_secret = { env = "INFISICAL_CLIENT_SECRET" }
+project_id = { env = "INFISICAL_PROJECT_ID" }
+environment = { env = "INFISICAL_ENVIRONMENT", default = "dev" }
+secret_path = "/google"
+refresh_interval_secs = 300
+
+# =============================================================================
+# Models
+# =============================================================================
+
+# Gemini 2.0 Flash (fast, cheap) - for testing
+[models.gemini-2-0-flash]
+routing = ["gemini"]
+
+[models.gemini-2-0-flash.providers.gemini]
+type = "google_ai_studio_gemini"
+model_name = "gemini-2.0-flash"
+api_key_location = "pool::google_pool"
+
+# =============================================================================
+# Functions
+# =============================================================================
+
+[functions.chat]
+type = "chat"
+
+[functions.chat.variants.gemini_flash]
+type = "chat_completion"
+model = "gemini-2-0-flash"
+
+# =============================================================================
+# Gateway Configuration
+# =============================================================================
+
+[gateway]
+bind_address = "0.0.0.0:3000"

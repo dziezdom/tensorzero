@@ -17,6 +17,7 @@ pub mod function; // types and methods for working with TensorZero functions
 pub mod howdy;
 pub mod http;
 pub mod inference; // model inference
+pub mod infisical; // Infisical secret manager integration
 pub mod jsonschema_util; // utilities for working with JSON schemas
 mod minijinja_util; // utilities for working with MiniJinja templates
 pub mod model; // types and methods for working with TensorZero-supported models
