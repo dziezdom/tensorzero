@@ -544,6 +544,236 @@ impl KeyProvider for EnvListKeyProvider {
     }
 }
 
+// ============================================================================
+// KeyPool - Thread-safe key pool with retry support
+// ============================================================================
+
+/// A thread-safe key pool that supports round-robin key selection and retry logic.
+///
+/// This is the main abstraction for managing multiple API keys with automatic
+/// failover when rate limits (429) or authentication errors (401) are encountered.
+///
+/// # Example
+///
+/// ```ignore
+/// use tensorzero_core::credentials::KeyPool;
+/// use secrecy::SecretString;
+///
+/// let keys = vec![
+///     SecretString::new("key-1".into()),
+///     SecretString::new("key-2".into()),
+/// ];
+/// let pool = KeyPool::new(keys, 3)?; // max 3 retries
+///
+/// // Get next key (round-robin)
+/// let key = pool.next_key()?;
+/// ```
+#[derive(Debug)]
+pub struct KeyPool {
+    keys: Vec<SecretString>,
+    counter: AtomicUsize,
+    max_retries: usize,
+}
+
+impl KeyPool {
+    /// Creates a new key pool with the specified keys and max retry count.
+    ///
+    /// # Arguments
+    /// * `keys` - List of API keys
+    /// * `max_retries` - Maximum number of retry attempts (0 = no retries)
+    ///
+    /// # Errors
+    /// Returns an error if the keys list is empty.
+    pub fn new(keys: Vec<SecretString>, max_retries: usize) -> Result<Self, Error> {
+        if keys.is_empty() {
+            return Err(Error::new(ErrorDetails::Config {
+                message: "KeyPool requires at least one key".to_string(),
+            }));
+        }
+        Ok(Self {
+            keys,
+            counter: AtomicUsize::new(0),
+            max_retries,
+        })
+    }
+
+    /// Creates a key pool from environment variables.
+    ///
+    /// Missing environment variables are skipped with a warning.
+    /// Returns an error if no valid keys are found.
+    pub fn from_env_vars(var_names: &[String], max_retries: usize) -> Result<Self, Error> {
+        let mut keys = Vec::new();
+        let mut missing_vars = Vec::new();
+
+        for var_name in var_names {
+            match std::env::var(var_name) {
+                Ok(value) => keys.push(SecretString::from(value)),
+                Err(_) => {
+                    missing_vars.push(var_name.clone());
+                    tracing::warn!("Environment variable '{var_name}' is not set, skipping");
+                }
+            }
+        }
+
+        if keys.is_empty() {
+            return Err(Error::new(ErrorDetails::ApiKeyMissing {
+                provider_name: "key_pool".to_string(),
+                message: format!(
+                    "No valid keys found. Missing environment variables: {missing_vars:?}"
+                ),
+            }));
+        }
+
+        Self::new(keys, max_retries)
+    }
+
+    /// Returns the next key in round-robin order.
+    pub fn next_key(&self) -> &SecretString {
+        let index = self.counter.fetch_add(1, Ordering::Relaxed) % self.keys.len();
+        &self.keys[index]
+    }
+
+    /// Returns the number of keys in the pool.
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Returns the maximum number of retries configured.
+    pub fn max_retries(&self) -> usize {
+        self.max_retries
+    }
+
+    /// Checks if more retries are available given the current attempt count.
+    pub fn can_retry(&self, attempts: usize) -> bool {
+        attempts < self.max_retries
+    }
+}
+
+// ============================================================================
+// Retry helpers
+// ============================================================================
+
+/// HTTP status codes that indicate a retryable error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryableStatusCode {
+    /// 429 Too Many Requests - Rate limit exceeded
+    RateLimited,
+    /// 401 Unauthorized - API key may be invalid/expired
+    Unauthorized,
+    /// 503 Service Unavailable - Temporary server issue
+    ServiceUnavailable,
+    /// 502 Bad Gateway - Temporary gateway issue
+    BadGateway,
+    /// 504 Gateway Timeout - Temporary timeout
+    GatewayTimeout,
+}
+
+impl RetryableStatusCode {
+    /// Checks if a status code is retryable and returns the variant if so.
+    pub fn from_status_code(code: u16) -> Option<Self> {
+        match code {
+            429 => Some(Self::RateLimited),
+            401 => Some(Self::Unauthorized),
+            503 => Some(Self::ServiceUnavailable),
+            502 => Some(Self::BadGateway),
+            504 => Some(Self::GatewayTimeout),
+            _ => None,
+        }
+    }
+
+    /// Checks if this error type should trigger a key rotation.
+    ///
+    /// Rate limits and auth errors suggest the current key is problematic,
+    /// while server errors might be temporary and not key-specific.
+    pub fn should_rotate_key(&self) -> bool {
+        matches!(self, Self::RateLimited | Self::Unauthorized)
+    }
+}
+
+/// Checks if an HTTP status code indicates a retryable error.
+///
+/// Returns `true` for:
+/// - 429 Too Many Requests (rate limit)
+/// - 401 Unauthorized (key might be expired/invalid)
+/// - 502, 503, 504 (temporary server issues)
+pub fn is_retryable_status_code(code: u16) -> bool {
+    RetryableStatusCode::from_status_code(code).is_some()
+}
+
+/// Checks if an HTTP status code should trigger key rotation.
+///
+/// Returns `true` for errors that suggest the current API key is problematic:
+/// - 429 Too Many Requests
+/// - 401 Unauthorized
+pub fn should_rotate_key_for_status(code: u16) -> bool {
+    RetryableStatusCode::from_status_code(code).is_some_and(|s| s.should_rotate_key())
+}
+
+/// Configuration for retry behavior.
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts.
+    pub max_retries: usize,
+    /// Whether to rotate keys on retryable errors.
+    pub rotate_keys: bool,
+    /// Base delay between retries in milliseconds.
+    pub base_delay_ms: u64,
+    /// Whether to use exponential backoff.
+    pub exponential_backoff: bool,
+    /// Status codes that should trigger a retry.
+    pub retryable_status_codes: Vec<u16>,
+}
+
+impl RetryConfig {
+    /// Checks if a status code should trigger a retry.
+    pub fn is_retryable(&self, status_code: u16) -> bool {
+        self.retryable_status_codes.contains(&status_code)
+    }
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            rotate_keys: true,
+            base_delay_ms: 100,
+            exponential_backoff: true,
+            retryable_status_codes: vec![429, 401, 502, 503, 504],
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Creates a retry config with no retries (fail immediately).
+    pub fn no_retry() -> Self {
+        Self {
+            max_retries: 0,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a retry config for high availability scenarios.
+    pub fn high_availability() -> Self {
+        Self {
+            max_retries: 5,
+            rotate_keys: true,
+            base_delay_ms: 50,
+            exponential_backoff: true,
+            retryable_status_codes: vec![429, 401, 502, 503, 504],
+        }
+    }
+
+    /// Calculates the delay for a given retry attempt.
+    pub fn delay_for_attempt(&self, attempt: usize) -> std::time::Duration {
+        let delay_ms = if self.exponential_backoff {
+            self.base_delay_ms * (1 << attempt.min(6)) // Cap at 2^6 = 64x
+        } else {
+            self.base_delay_ms
+        };
+        std::time::Duration::from_millis(delay_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,5 +981,127 @@ mod tests {
             }
             _ => panic!("Expected Infisical"),
         }
+    }
+
+    // ========================================================================
+    // KeyPool tests
+    // ========================================================================
+
+    #[test]
+    fn test_key_pool_round_robin() {
+        let keys = vec![
+            SecretString::new("key-1".into()),
+            SecretString::new("key-2".into()),
+            SecretString::new("key-3".into()),
+        ];
+        let pool = KeyPool::new(keys, 3).unwrap();
+
+        assert_eq!(pool.key_count(), 3);
+        assert_eq!(pool.max_retries(), 3);
+
+        // Round robin
+        assert_eq!(pool.next_key().expose_secret(), "key-1");
+        assert_eq!(pool.next_key().expose_secret(), "key-2");
+        assert_eq!(pool.next_key().expose_secret(), "key-3");
+        assert_eq!(pool.next_key().expose_secret(), "key-1"); // wrap around
+    }
+
+    #[test]
+    fn test_key_pool_empty() {
+        let result = KeyPool::new(vec![], 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_key_pool_can_retry() {
+        let keys = vec![SecretString::new("key-1".into())];
+        let pool = KeyPool::new(keys, 3).unwrap();
+
+        assert!(pool.can_retry(0));
+        assert!(pool.can_retry(1));
+        assert!(pool.can_retry(2));
+        assert!(!pool.can_retry(3));
+        assert!(!pool.can_retry(4));
+    }
+
+    // ========================================================================
+    // Retry helper tests
+    // ========================================================================
+
+    #[test]
+    fn test_retryable_status_codes() {
+        assert!(is_retryable_status_code(429)); // Rate limit
+        assert!(is_retryable_status_code(401)); // Unauthorized
+        assert!(is_retryable_status_code(502)); // Bad Gateway
+        assert!(is_retryable_status_code(503)); // Service Unavailable
+        assert!(is_retryable_status_code(504)); // Gateway Timeout
+
+        assert!(!is_retryable_status_code(200)); // OK
+        assert!(!is_retryable_status_code(400)); // Bad Request
+        assert!(!is_retryable_status_code(403)); // Forbidden
+        assert!(!is_retryable_status_code(404)); // Not Found
+        assert!(!is_retryable_status_code(500)); // Internal Server Error
+    }
+
+    #[test]
+    fn test_should_rotate_key() {
+        assert!(should_rotate_key_for_status(429)); // Rate limit -> rotate
+        assert!(should_rotate_key_for_status(401)); // Unauthorized -> rotate
+
+        assert!(!should_rotate_key_for_status(502)); // Server error -> don't rotate
+        assert!(!should_rotate_key_for_status(503)); // Server error -> don't rotate
+        assert!(!should_rotate_key_for_status(200)); // Not retryable
+    }
+
+    #[test]
+    fn test_retry_config_delay() {
+        let config = RetryConfig::default();
+
+        // Exponential backoff: 100ms, 200ms, 400ms, 800ms...
+        assert_eq!(config.delay_for_attempt(0).as_millis(), 100);
+        assert_eq!(config.delay_for_attempt(1).as_millis(), 200);
+        assert_eq!(config.delay_for_attempt(2).as_millis(), 400);
+        assert_eq!(config.delay_for_attempt(3).as_millis(), 800);
+
+        // Linear config
+        let linear = RetryConfig {
+            exponential_backoff: false,
+            base_delay_ms: 50,
+            ..Default::default()
+        };
+        assert_eq!(linear.delay_for_attempt(0).as_millis(), 50);
+        assert_eq!(linear.delay_for_attempt(5).as_millis(), 50);
+    }
+
+    #[test]
+    fn test_retry_config_presets() {
+        let no_retry = RetryConfig::no_retry();
+        assert_eq!(no_retry.max_retries, 0);
+
+        let ha = RetryConfig::high_availability();
+        assert_eq!(ha.max_retries, 5);
+        assert!(ha.rotate_keys);
+    }
+
+    #[test]
+    fn test_retry_config_is_retryable() {
+        let config = RetryConfig::default();
+        assert!(config.is_retryable(429));
+        assert!(config.is_retryable(401));
+        assert!(config.is_retryable(502));
+        assert!(config.is_retryable(503));
+        assert!(config.is_retryable(504));
+
+        assert!(!config.is_retryable(200));
+        assert!(!config.is_retryable(400));
+        assert!(!config.is_retryable(500));
+
+        // Custom config with only 429
+        let custom = RetryConfig {
+            retryable_status_codes: vec![429],
+            ..Default::default()
+        };
+        assert!(custom.is_retryable(429));
+        assert!(!custom.is_retryable(401));
     }
 }

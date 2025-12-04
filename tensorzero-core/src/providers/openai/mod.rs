@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::instrument;
@@ -20,6 +21,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::cache::ModelProviderRequest;
+use crate::credentials::KeyPool;
 use crate::embeddings::EmbeddingEncodingFormat;
 use crate::embeddings::{
     Embedding, EmbeddingInput, EmbeddingProvider, EmbeddingProviderRequestInfo,
@@ -183,6 +185,8 @@ pub enum OpenAICredentials {
         default: Box<OpenAICredentials>,
         fallback: Box<OpenAICredentials>,
     },
+    /// A pool of API keys with round-robin selection and retry support.
+    Pool(Arc<KeyPool>),
 }
 
 impl TryFrom<Credential> for OpenAICredentials {
@@ -206,6 +210,9 @@ impl TryFrom<Credential> for OpenAICredentials {
 }
 
 impl OpenAICredentials {
+    /// Gets an API key as a reference. Not supported for Pool credentials.
+    ///
+    /// For Pool credentials, use `get_api_key_owned` instead.
     pub fn get_api_key<'a>(
         &'a self,
         dynamic_api_keys: &'a InferenceCredentials,
@@ -235,6 +242,57 @@ impl OpenAICredentials {
                 }
             }
             OpenAICredentials::None => Ok(None),
+            OpenAICredentials::Pool(_) => Err(DelayedError::new(ErrorDetails::Config {
+                message: "Pool credentials require using get_api_key_owned()".to_string(),
+            })),
+        }
+    }
+
+    /// Gets an API key as an owned value. Works for all credential types including Pool.
+    ///
+    /// For Pool credentials, this returns the next key in round-robin order.
+    pub fn get_api_key_owned(
+        &self,
+        dynamic_api_keys: &InferenceCredentials,
+    ) -> Result<Option<SecretString>, DelayedError> {
+        match self {
+            OpenAICredentials::Static(api_key) => Ok(Some(api_key.clone())),
+            OpenAICredentials::Dynamic(key_name) => {
+                Some(dynamic_api_keys.get(key_name).cloned().ok_or_else(|| {
+                    DelayedError::new(ErrorDetails::ApiKeyMissing {
+                        provider_name: PROVIDER_NAME.to_string(),
+                        message: format!("Dynamic api key `{key_name}` is missing"),
+                    })
+                }))
+                .transpose()
+            }
+            OpenAICredentials::WithFallback { default, fallback } => {
+                match default.get_api_key_owned(dynamic_api_keys) {
+                    Ok(key) => Ok(key),
+                    Err(e) => {
+                        e.log_at_level(
+                            "Using fallback credential, as default credential is unavailable: ",
+                            tracing::Level::WARN,
+                        );
+                        fallback.get_api_key_owned(dynamic_api_keys)
+                    }
+                }
+            }
+            OpenAICredentials::None => Ok(None),
+            OpenAICredentials::Pool(pool) => Ok(Some(pool.next_key().clone())),
+        }
+    }
+
+    /// Returns true if these credentials use a key pool.
+    pub fn is_pool(&self) -> bool {
+        matches!(self, OpenAICredentials::Pool(_))
+    }
+
+    /// Returns the key pool if this is a Pool credential, None otherwise.
+    pub fn as_pool(&self) -> Option<&Arc<KeyPool>> {
+        match self {
+            OpenAICredentials::Pool(pool) => Some(pool),
+            _ => None,
         }
     }
 }
@@ -364,13 +422,24 @@ impl WrappedProvider for OpenAIProvider {
     }
 }
 
-impl InferenceProvider for OpenAIProvider {
-    async fn infer<'a>(
+// ============================================================================
+// Retry helpers for KeyPool-based credentials
+// ============================================================================
+
+use crate::credentials::{is_retryable_status_code, should_rotate_key_for_status, RetryConfig};
+
+impl OpenAIProvider {
+    /// Performs a single inference attempt with an optional explicit API key.
+    ///
+    /// This is the core inference logic extracted from the original `infer` method.
+    /// If `override_api_key` is Some, it will be used instead of the configured credentials.
+    async fn infer_single_attempt<'a>(
         &'a self,
         request: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
+        override_api_key: Option<&SecretString>,
     ) -> Result<ProviderInferenceResponse, Error> {
         let request_url = match self.api_type {
             OpenAIAPIType::Responses => {
@@ -380,15 +449,20 @@ impl InferenceProvider for OpenAIProvider {
                 get_chat_url(self.api_base.as_ref().unwrap_or(&OPENAI_DEFAULT_BASE_URL))?
             }
         };
-        let api_key = self
-            .credentials
-            .get_api_key(dynamic_api_keys)
-            .map_err(|e| e.log())?;
+
+        let api_key: Option<SecretString> = if let Some(key) = override_api_key {
+            Some(key.clone())
+        } else {
+            self.credentials
+                .get_api_key_owned(dynamic_api_keys)
+                .map_err(|e| e.log())?
+        };
+
         let start_time = Instant::now();
         let request_body = self.make_body(request).await?;
         let mut request_builder = http_client.post(request_url);
 
-        if let Some(api_key) = api_key {
+        if let Some(ref api_key) = api_key {
             request_builder = request_builder.bearer_auth(api_key.expose_secret());
         }
 
@@ -486,6 +560,114 @@ impl InferenceProvider for OpenAIProvider {
                 PROVIDER_TYPE,
             ))
         }
+    }
+
+    /// Performs inference with retry logic for KeyPool credentials.
+    ///
+    /// On retryable errors (429 Too Many Requests, 401 Unauthorized, etc.),
+    /// this method will rotate to the next key in the pool and retry.
+    async fn infer_with_retry<'a>(
+        &'a self,
+        request: ModelProviderRequest<'a>,
+        http_client: &'a TensorzeroHttpClient,
+        dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
+        pool: &Arc<KeyPool>,
+    ) -> Result<ProviderInferenceResponse, Error> {
+        let retry_config = RetryConfig::default();
+        let max_attempts = pool.max_retries() + 1; // +1 for the initial attempt
+        let mut last_error: Option<Error> = None;
+
+        for attempt in 0..max_attempts {
+            let api_key = pool.next_key();
+
+            let result = self
+                .infer_single_attempt(
+                    request,
+                    http_client,
+                    dynamic_api_keys,
+                    model_provider,
+                    Some(api_key),
+                )
+                .await;
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    // Check if this is a retryable error
+                    let status_code = match e.get_details() {
+                        ErrorDetails::InferenceClient { status_code, .. } => {
+                            status_code.map(|s| s.as_u16())
+                        }
+                        _ => None,
+                    };
+
+                    let is_retryable = status_code.map(is_retryable_status_code).unwrap_or(false);
+
+                    let has_more_attempts = attempt + 1 < max_attempts;
+
+                    if let (true, true, Some(code)) = (is_retryable, has_more_attempts, status_code)
+                    {
+                        if should_rotate_key_for_status(code) {
+                            tracing::warn!(
+                                "Retrying inference with next key (attempt {}/{}, status: {})",
+                                attempt + 2, // +2 because attempt is 0-indexed and we want to show next attempt
+                                max_attempts,
+                                code
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Retrying inference (attempt {}/{}, status: {})",
+                                attempt + 2,
+                                max_attempts,
+                                code
+                            );
+                        }
+
+                        // Wait before retry with exponential backoff
+                        let delay = retry_config.delay_for_attempt(attempt);
+                        tokio::time::sleep(delay).await;
+
+                        last_error = Some(e);
+                        continue;
+                    }
+
+                    // Non-retryable error or no more attempts, return immediately
+                    return Err(e);
+                }
+            }
+        }
+
+        // All attempts exhausted
+        Err(last_error.unwrap_or_else(|| {
+            Error::new(ErrorDetails::InferenceServer {
+                message: "All retry attempts exhausted".to_string(),
+                raw_request: None,
+                raw_response: None,
+                provider_type: PROVIDER_TYPE.to_string(),
+            })
+        }))
+    }
+}
+
+impl InferenceProvider for OpenAIProvider {
+    async fn infer<'a>(
+        &'a self,
+        request: ModelProviderRequest<'a>,
+        http_client: &'a TensorzeroHttpClient,
+        dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
+    ) -> Result<ProviderInferenceResponse, Error> {
+        // For Pool credentials, use retry logic with key rotation
+        if let Some(pool) = self.credentials.as_pool() {
+            return self
+                .infer_with_retry(request, http_client, dynamic_api_keys, model_provider, pool)
+                .await;
+        }
+
+        // For non-pool credentials, use the original single-attempt logic
+        self.infer_single_attempt(request, http_client, dynamic_api_keys, model_provider, None)
+            .await
     }
 
     async fn infer_stream<'a>(
@@ -4274,6 +4456,44 @@ mod tests {
             result.unwrap_err().get_details(),
             ErrorDetails::Config { message } if message.contains("Invalid api_key_location")
         ));
+    }
+
+    #[test]
+    fn test_openai_credentials_pool() {
+        use secrecy::ExposeSecret;
+
+        // Create a pool with 3 keys
+        let keys = vec![
+            SecretString::from("key-1"),
+            SecretString::from("key-2"),
+            SecretString::from("key-3"),
+        ];
+        let pool = Arc::new(KeyPool::new(keys, 3).unwrap());
+        let creds = OpenAICredentials::Pool(pool);
+
+        // Verify it's a pool
+        assert!(creds.is_pool());
+        assert!(creds.as_pool().is_some());
+
+        // Test get_api_key_owned with round-robin
+        let empty_creds = InferenceCredentials::default();
+
+        let key1 = creds.get_api_key_owned(&empty_creds).unwrap().unwrap();
+        assert_eq!(key1.expose_secret(), "key-1");
+
+        let key2 = creds.get_api_key_owned(&empty_creds).unwrap().unwrap();
+        assert_eq!(key2.expose_secret(), "key-2");
+
+        let key3 = creds.get_api_key_owned(&empty_creds).unwrap().unwrap();
+        assert_eq!(key3.expose_secret(), "key-3");
+
+        // Wrap around
+        let key4 = creds.get_api_key_owned(&empty_creds).unwrap().unwrap();
+        assert_eq!(key4.expose_secret(), "key-1");
+
+        // get_api_key should return an error for Pool
+        let result = creds.get_api_key(&empty_creds);
+        assert!(result.is_err());
     }
 
     #[test]
